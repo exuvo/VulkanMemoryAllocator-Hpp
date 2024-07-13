@@ -6,12 +6,26 @@ project(
     DESCRIPTION "C++ bindings for the VulkanMemoryAllocator library."
     LANGUAGES C CXX)
 
-find_package(Vulkan REQUIRED)
-
-if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/VulkanMemoryAllocator/CMakeLists.txt)
-    add_subdirectory(VulkanMemoryAllocator)
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/Vulkan-Headers/CMakeLists.txt)
+    add_subdirectory(Vulkan-Headers)
+    install(
+        TARGETS Vulkan-Headers
+        EXPORT VulkanMemoryAllocator-HppTargets
+    )
 else()
-    find_package(VulkanMemoryAllocator REQUIRED)
+    #find_package(Vulkan REQUIRED)
+endif()
+
+if(TARGET VulkanMemoryAllocator)
+    add_library(VulkanMemoryAllocator::VulkanMemoryAllocator ALIAS VulkanMemoryAllocator)
+elseif(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/VulkanMemoryAllocator/CMakeLists.txt)
+    add_subdirectory(VulkanMemoryAllocator)
+    install(
+        TARGETS VulkanMemoryAllocator
+        EXPORT VulkanMemoryAllocator-HppTargets
+    )
+else()
+    #find_package(VulkanMemoryAllocator REQUIRED)
 endif()
 
 add_library(VulkanMemoryAllocator-Hpp INTERFACE)
@@ -24,8 +38,8 @@ target_include_directories(VulkanMemoryAllocator-Hpp
 
 target_link_libraries(VulkanMemoryAllocator-Hpp
     INTERFACE
-        Vulkan::Vulkan
-        VulkanMemoryAllocator::VulkanMemoryAllocator
+        Vulkan::Headers
+        VulkanMemoryAllocator
 )
 
 install(
