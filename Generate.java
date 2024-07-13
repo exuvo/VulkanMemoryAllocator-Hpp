@@ -16,6 +16,8 @@ import java.util.stream.Stream;
  */
 public class Generate {
 
+    static Set<String> BLACKLISTED_UNIQUE_HANDLES = Set.of("DefragmentationContext"); // These handles will not have unique variants
+
     /**
      * Represents single sequence of #if - [#elif]... - [#else] - #endif statements.
      * It forms a tree structure which is used to check all active conditions at any point in source code.
@@ -155,7 +157,7 @@ public class Generate {
                                       String template, List<TemplateEntry<T>> entries, String... replacementStrings) {
         int lastIndex = 0;
         StringBuilder content = new StringBuilder();
-        ifdef = ifdef.goTo(content, sourcePosition);
+        if (ifdef != null) ifdef = ifdef.goTo(content, sourcePosition);
         Matcher loopMatcher = TemplateEntry.loopPattern.matcher(template);
         while (loopMatcher.find()) {
             content.append(template, lastIndex, loopMatcher.start());
@@ -195,19 +197,27 @@ public class Generate {
             String lastPart = entryTemplate.substring(li);
             entryTextParts.add(i -> lastPart);
             for (int i = 0; i < entries.size(); i++) {
-                ifdef = ifdef.goTo(content, entries.get(i).position);
+                if (ifdef != null) ifdef = ifdef.goTo(content, entries.get(i).position);
                 if (i != 0) content.append(indent);
                 for (var e : entryTextParts) content.append(e.apply(i));
             }
-            ifdef = ifdef.goTo(content, sourcePosition);
+            if (ifdef != null) ifdef = ifdef.goTo(content, sourcePosition);
             content.append("\n");
         }
         content.append(template.substring(lastIndex));
-        ifdef.goTo(content, -1);
+        if (ifdef != null) ifdef.goTo(content, -1);
         return processTemplate(content.toString(), replacementStrings);
     }
 
-    static void generateEnums(String orig, Ifdef.Range ifdef) throws IOException {
+    /**
+     * Simplified version of {@link #processTemplate(Ifdef.Range, int, String, List, String...)}.
+     */
+    static <T> String processTemplate(String template, Stream<T> entries, String... replacementStrings) {
+        return processTemplate(null, 0, template, entries.map(e -> new TemplateEntry<>(e, 0)).toList(), replacementStrings);
+    }
+
+    static List<String> generateEnums(String orig, Ifdef.Range ifdef) throws IOException {
+        List<String> enums = new ArrayList<>();
         record Entry(String name, String originalName) {}
         StringBuilder content = new StringBuilder();
         Pattern typedefPattern = Pattern.compile("typedef\\s+enum\\s+Vma(\\w+)");
@@ -217,6 +227,8 @@ public class Generate {
             String name = typedefMatcher.group(1);
             boolean flagBits = name.endsWith("FlagBits");
             String flags = flagBits ? name.substring(0, name.length() - 4) + "s" : null;
+            enums.add(name);
+            if (flagBits) enums.add(flags);
 
             String body = orig.substring(typedefMatcher.end(), orig.indexOf("}", typedefMatcher.end()));
             Matcher entryMatcher = entryPattern.matcher(body);
@@ -242,10 +254,12 @@ public class Generate {
                         {{{e${name} = ${originalName}${,$}}}}
                       };
                     
+                    # if !defined( VULKAN_HPP_NO_TO_STRING )
                       VULKAN_HPP_INLINE std::string to_string($0 value) {
                         {{{if (value == $0::e${name}) return "${name}";}}}
                         return "invalid ( " + VULKAN_HPP_NAMESPACE::toHexString(static_cast<uint32_t>(value)) + " )";
                       }
+                    # endif
                     }
                     """, entries, name, flagBits ? (" : Vma" + flags) : ""));
             if (flagBits) {
@@ -279,12 +293,14 @@ public class Generate {
                             return ~($1(bits));
                           }
                         
+                        # if !defined( VULKAN_HPP_NO_TO_STRING )
                           VULKAN_HPP_INLINE std::string to_string($1 value) {
                             if (!value) return "{}";
                             std::string result;
                             {{{if (value & $0::e${name}) result += "${name} | ";}}}
                             return "{ " + result.substr( 0, result.size() - 3 ) + " }";
                           }
+                        # endif
                         }
                         """, entries, name, flags));
             }
@@ -296,6 +312,7 @@ public class Generate {
                 
                 #endif
                 """, content.toString()));
+        return enums;
     }
 
     enum VarTag {
@@ -311,19 +328,21 @@ public class Generate {
      * @param constant whether it's constant
      * @param pointer whether it's a pointer
      * @param originalType original type
+     * @param underlyingType underlying type (`type` without const and pointers applied)
      */
-    record Var(String originalType, boolean constant, String type, boolean pointer, VarTag tag, String lenIfNotNull, boolean primitive, String name) {
+    record Var(String originalType, boolean constant, String type, boolean pointer, VarTag tag,
+               String lenIfNotNull, boolean primitive, String underlyingType, String name) {
 
         static final Pattern pattern = Pattern.compile(
                 "(const\\s+)?(\\w+)" +
                 "(\\s*\\*)?(?:\\s+VMA_(NULLABLE|NOT_NULL)(?:_NON_DISPATCHABLE)?)?" +
                 "(\\s*\\*)?(?:\\s+VMA_(NULLABLE|NOT_NULL)(?:_NON_DISPATCHABLE)?)?" +
-                "(?:\\s+VMA_LEN_IF_NOT_NULL\\(\\s*([^)]+)\\s*\\))?" +
+                "(?:\\s+(VMA_LEN_IF_NOT_NULL|VMA_EXTENDS_VK_STRUCT)\\(\\s*([^)]+)\\s*\\))?" +
                 "\\s+(\\w+)" +
                 "((?:\\s*\\[\\w+])+)?" +
                 "\\s*[;,)]");
         private static String applyConstAndPointers(String type, boolean constant, boolean pointer1, boolean pointer2) {
-            if (constant) type = "const " + type;
+            if (constant && (pointer1 || pointer2)) type = "const " + type;
             if (pointer1) type += "*";
             if (pointer2) type += "*";
             return type;
@@ -333,6 +352,7 @@ public class Generate {
 
             if (type.startsWith("Vk")) type = "VULKAN_HPP_NAMESPACE::" + type.substring(2);
             else if (type.startsWith("Vma")) type = type.substring(3);
+            String underlyingType = type;
 
             boolean primitive = switch (type) {
                 case "void", "char", "uint32_t", "size_t" -> true;
@@ -349,7 +369,7 @@ public class Generate {
                 if (tag2 != null) tag = VarTag.valueOf(tag2);
             }  else if (tag1 != null) tag = VarTag.valueOf(tag1);
 
-            String arr = matcher.group(9);
+            String arr = matcher.group(10);
             if (arr != null) {
                 arr = arr.strip();
                 while (!arr.isEmpty()) {
@@ -362,7 +382,12 @@ public class Generate {
 
             if (p1 && p2) c = false; // double pointer, then first-level pointer is not const
 
-            return new Var(originalType, c, type, p1 || p2, tag, matcher.group(7), primitive, matcher.group(8));
+            String lenIfNotNull = null;
+            if ((matcher.group(7) != null) && (matcher.group(7).equals("VMA_LEN_IF_NOT_NULL"))) {
+                lenIfNotNull = matcher.group(8);
+            }
+
+            return new Var(originalType, c, type, p1 || p2, tag, lenIfNotNull, primitive, underlyingType, matcher.group(9));
         }
 
         public String capitalName() {
@@ -472,7 +497,8 @@ public class Generate {
         final boolean dispatchable;
         final StringBuilder declarations = new StringBuilder(), definitions = new StringBuilder();
         Ifdef.Range ifdef;
-        final Set<Handle> dependencies = new HashSet<>();
+        final Set<Handle> dependencies = new LinkedHashSet<>();
+        final Set<String> methods = new LinkedHashSet<>();
         Handle owner = null;
         boolean appended = false;
 
@@ -481,6 +507,10 @@ public class Generate {
             this.dispatchable = dispatchable;
             this.ifdef = ifdef;
         }
+
+        public String name() { return name; }
+
+        boolean hasUniqueVariant() { return !BLACKLISTED_UNIQUE_HANDLES.contains(name); }
 
         String getLowerName() {
             return name.substring(0, 1).toLowerCase() + name.substring(1);
@@ -536,15 +566,18 @@ public class Generate {
                       VULKAN_HPP_STATIC_ASSERT(sizeof($0) == sizeof(Vma$0),
                                                "handle and wrapper have different size!");
                     }
+                    """ + (hasUniqueVariant() ? """
                     #ifndef VULKAN_HPP_NO_SMART_HANDLE
                     namespace VULKAN_HPP_NAMESPACE {
-                      template<> struct UniqueHandleTraits<VMA_HPP_NAMESPACE::$0, VMA_HPP_NAMESPACE::Dispatcher> {
+                      template<> class UniqueHandleTraits<VMA_HPP_NAMESPACE::$0, VMA_HPP_NAMESPACE::Dispatcher> {
+                        public:
                         using deleter = VMA_HPP_NAMESPACE::Deleter<VMA_HPP_NAMESPACE::$0, $3>;
                       };
                     }
                     namespace VMA_HPP_NAMESPACE { using Unique$0 = VULKAN_HPP_NAMESPACE::UniqueHandle<$0, Dispatcher>; }
                     #endif
-                    """, name, getLowerName(), declarations.toString().indent(4),
+                    """ : ""),
+                    name, getLowerName(), declarations.toString().indent(4),
                     owner == null ? "void" : "VMA_HPP_NAMESPACE::" + owner.name);
         }
         String generateNamespace() {
@@ -575,16 +608,14 @@ public class Generate {
         }
     }
 
-    static Set<String> BLACKLISTED_UNIQUE_HANDLES = Set.of("DefragmentationContext"); // These handles will not have unique variants
-
-    static void generateHandles(String orig, Ifdef.Range ifdef, List<String> structs) throws IOException {
+    static List<Handle> generateHandles(String orig, Ifdef.Range ifdef, List<String> structs) throws IOException {
         // Forward declarations for structs
         StringBuilder forwardDeclarations = new StringBuilder(), declarations = new StringBuilder(), definitions = new StringBuilder();
         for (String s : structs) forwardDeclarations.append("\nstruct ").append(s).append(";");
 
         // Find all handles
         Handle namespaceHandle = new Handle(null, false, ifdef);
-        Map<String, Handle> handles = new HashMap<>();
+        Map<String, Handle> handles = new LinkedHashMap<>();
         Pattern handlePattern = Pattern.compile("VK_DEFINE_(NON_DISPATCHABLE_)?HANDLE\\s*\\(\\s*Vma(\\w+)\\s*\\)");
         Matcher handleMatcher = handlePattern.matcher(orig);
         while (handleMatcher.find()) {
@@ -624,13 +655,14 @@ public class Generate {
             String funcName = "vma" + name; // Original function name
             if (handle != namespaceHandle && name.equals("Destroy" + handle.name)) name = "destroy"; // E.g. Allocator::destroyAllocator -> Allocator::destroy
             String methodName = name.substring(0, 1).toLowerCase() + name.substring(1); // Generated method name
+            handle.methods.add(methodName);
 
             // Find dependencies of array sizes
             Integer[] arrayByLengthIndex = new Integer[params.size()];
             for (int i = 0; i < params.size(); i++) {
                 Var v = params.get(i);
                 if (v.lenIfNotNull == null) continue;
-                if (v.constant) { // Input array, respective size parameter can be deduced
+                if (v.constant && !v.underlyingType.equals("void")) { // Input array, respective size parameter can be deduced
                     Integer l = paramIndexByName.get(v.lenIfNotNull);
                     if (l != null && arrayByLengthIndex[l] == null) arrayByLengthIndex[l] = i;
                 }
@@ -640,7 +672,7 @@ public class Generate {
             List<Integer> outputs = new ArrayList<>(), defaultedOutputs = new ArrayList<>();
             for (int i = 0; i < params.size(); i++) {
                 Var v = params.get(i);
-                if (v.pointer && !v.constant) {
+                if (v.pointer && !v.constant && !v.originalType.equals("void*")) {
                     if (v.tag == VarTag.NOT_NULL) outputs.add(i);
                     else if (!v.primitive) {
                         defaultedOutputs.add(i);
@@ -696,7 +728,7 @@ public class Generate {
                         }
 
                         String t = p.type;
-                        if (enhanced && p.pointer) {
+                        if (enhanced && p.pointer && !p.underlyingType.equals("void")) {
                             if (p.lenIfNotNull != null) t = "VULKAN_HPP_NAMESPACE::" + (p.constant ? "ArrayProxy<" : "ArrayProxyNoTemporaries<") + p.stripPtr() + ">";
                             else if (p.tag == VarTag.NOT_NULL) t = p.stripPtr() + "&";
                             else if (!p.constant && !p.primitive) t = "VULKAN_HPP_NAMESPACE::Optional<" + p.stripPtr() + ">";
@@ -802,18 +834,18 @@ public class Generate {
                         if (uniqueHandle) {
                             if (params.get(outputs.get(0)).lenIfNotNull != null) {
                                 returnValue = "createUniqueHandleVector(" + returnValue +
-                                        (handle != namespaceHandle ? ", this" : "") +
+                                        (handle != namespaceHandle ? ", *this" : "") +
                                         (customVectorAllocator ? ", vectorAllocator)" : ", VectorAllocator())");
                             } else {
                                 returnValue = "createUniqueHandle(" + returnValue +
-                                        (handle != namespaceHandle ? ", this)" : ")");
+                                        (handle != namespaceHandle ? ", *this)" : ")");
                             }
                         }
                         if (ret.equals("void")) returnValue = "result";
                         else returnValue = "result, " + returnValue;
-                        s.append("\nresultCheck(result, VMA_HPP_NAMESPACE_STRING \"::");
+                        s.append("\nVULKAN_HPP_NAMESPACE::detail::resultCheck(result, VMA_HPP_NAMESPACE_STRING \"::");
                         if (handle != namespaceHandle) s.append(handle.name).append("::");
-                        s.append(methodName).append("\");\nreturn createResultValueType(").append(returnValue).append(");");
+                        s.append(methodName).append("\");\nreturn VULKAN_HPP_NAMESPACE::detail::createResultValueType(").append(returnValue).append(");");
                     } else if (!ret.equals("void")) s.append("\nreturn ").append(returnValue).append(";");
                     return processTemplate("""
                                 $0 {
@@ -866,6 +898,49 @@ public class Generate {
                 }
                 #endif
                 """, definitions.toString()));
+        return Stream.concat(Stream.of(namespaceHandle), handles.values().stream()).toList();
+    }
+
+    static void generateModule(List<String> enums, List<String> structs, List<Handle> handles) throws IOException {
+        Files.writeString(Path.of("src/vk_mem_alloc.cppm"), processTemplate("""
+                module;
+                #define VMA_IMPLEMENTATION
+                #include <vk_mem_alloc.hpp>
+                export module vk_mem_alloc_hpp;
+                
+                export namespace VMA_HPP_NAMESPACE {
+                  using VMA_HPP_NAMESPACE::operator|;
+                  using VMA_HPP_NAMESPACE::operator&;
+                  using VMA_HPP_NAMESPACE::operator^;
+                  using VMA_HPP_NAMESPACE::operator~;
+                  using VMA_HPP_NAMESPACE::to_string;
+                  using VMA_HPP_NAMESPACE::functionsFromDispatcher;
+                  {{{using VMA_HPP_NAMESPACE::${toString};}}}
+                }
+                
+                """, Stream.concat(Stream.concat(enums.stream(), structs.stream()), handles.stream()
+                        .flatMap(h -> h.name == null ? h.methods.stream() : Stream.of(h.name)))) +
+                processTemplate("""
+                #ifndef VULKAN_HPP_NO_SMART_HANDLE
+                export namespace VMA_HPP_NAMESPACE {
+                  using VMA_HPP_NAMESPACE::UniqueBuffer;
+                  using VMA_HPP_NAMESPACE::UniqueImage;
+                  {{{using VMA_HPP_NAMESPACE::Unique${name};}}}
+                }
+                #endif
+                
+                module : private;
+                
+                #ifndef VULKAN_HPP_NO_SMART_HANDLE
+                // Instantiate unique handle templates.
+                // This is a workaround for MSVC bugs, but wouldn't harm on other compilers anyway.
+                namespace VULKAN_HPP_NAMESPACE {
+                  template class UniqueHandle<Buffer, VMA_HPP_NAMESPACE::Dispatcher>;
+                  template class UniqueHandle<Image, VMA_HPP_NAMESPACE::Dispatcher>;
+                  {{{template class UniqueHandle<VMA_HPP_NAMESPACE::${name}, VMA_HPP_NAMESPACE::Dispatcher>;}}}
+                }
+                #endif
+                """, handles.stream().skip(1).filter(Handle::hasUniqueVariant)));
     }
 
     public static void main(String[] args) throws Exception {
@@ -880,9 +955,10 @@ public class Generate {
 
         Ifdef.Range ifdef = Ifdef.buildTree(orig, 2);
 
-        generateEnums(orig, ifdef);
+        List<String> enums = generateEnums(orig, ifdef);
         List<String> structs = generateStructs(orig, ifdef);
-        generateHandles(orig, ifdef, structs);
+        List<Handle> handles = generateHandles(orig, ifdef, structs);
+        generateModule(enums, structs, handles);
     }
 
 }
