@@ -1,0 +1,33 @@
+name: Build
+on:
+  workflow_dispatch:
+  workflow_call:
+  pull_request:
+  schedule:
+    - cron: "50 5 * * 6" # 05:50 UTC each Saturday, after releases of https://github.com/KhronosGroup/Vulkan-Headers
+jobs:
+  find-latest-vulkan:
+    name: Find latest Vulkan
+    runs-on: ubuntu-latest
+    outputs:
+      latest-vulkan: ${{steps.fetch-tags.outputs.latest}}
+    steps:
+      - id: fetch-tags
+        name: Fetch tags
+        run: |
+          {
+            echo -n 'latest='
+            git ls-remote --tags --sort='-v:refname' 'https://github.com/KhronosGroup/Vulkan-Headers.git' \
+            'refs/tags/v[0-9]*.[0-9]*.*[0-9]' | grep --max-count 1 -o -E 'v[0-9]+\.[0-9]+\.[0-9]+'
+          } | tee -a $GITHUB_OUTPUT
+  build-min-vulkan:
+    name: Build with minimum Vulkan
+    uses: ./.github/workflows/build-custom-vulkan.yml
+    with:
+      vulkan: 'KhronosGroup/Vulkan-Headers'
+  build-max-vulkan:
+    name: Build with Vulkan ${{needs.find-latest-vulkan.outputs.latest-vulkan}}
+    needs: find-latest-vulkan
+    uses: ./.github/workflows/build-custom-vulkan.yml
+    with:
+      vulkan: ${{format('KhronosGroup/Vulkan-Headers#{0}', needs.find-latest-vulkan.outputs.latest-vulkan)}}
